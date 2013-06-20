@@ -17,11 +17,7 @@
 
 package shark
 
-import java.io.File
-import java.io.FileNotFoundException
-import java.io.IOException
-import java.io.PrintStream
-import java.io.UnsupportedEncodingException
+import java.io._
 import java.net.URLClassLoader
 import java.util.ArrayList
 import jline.{History, ConsoleReader}
@@ -40,6 +36,7 @@ import org.apache.hadoop.hive.ql.processors.{CommandProcessor, CommandProcessorF
 import org.apache.hadoop.hive.ql.session.SessionState
 import org.apache.hadoop.hive.shims.ShimLoader
 import org.apache.hadoop.io.IOUtils
+import scala.Some
 
 
 object SharkCliDriver {
@@ -335,22 +332,25 @@ class SharkCliDriver(loadRdds: Boolean = false) extends CliDriver with LogHelper
   }
 
   override def processFile(fileName: String): Int = {
+    def process(bufferedReader: BufferedReader): Int = {
+      //TODO: should have a catch
+      try {
+        val rc = processReader(bufferedReader)
+        bufferedReader.close()
+        rc
+      }
+      finally {
+        IOUtils.closeStream(bufferedReader)
+      }
+    }
+
     def processS3Reader():Int = {
       // For S3 file, fetch it from S3 and pass it to Hive.
       val conf = ss.getConf
 
       Utils.setAwsCredentials(conf)
       Utils.createReaderForS3(fileName, conf) match {
-        case Some(bufferedReader) => {
-          try {
-            val rc = processReader(bufferedReader)
-            bufferedReader.close()
-            rc
-          }
-          finally {
-            IOUtils.closeStream(bufferedReader)
-          }
-        }
+        case Some(bufferedReader) => process(bufferedReader)
         case _ => 0
       }
     }
