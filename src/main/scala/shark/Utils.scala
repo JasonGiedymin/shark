@@ -27,8 +27,11 @@ object Utils {
 
   /**
    * Convert a memory quantity in bytes to a human-readable string such as "4.0 MB".
+   * Prefix up-to PB when legacy is set to false (default = true)
+   * Otherwise, TB is the maximum.
    */
-  def memoryBytesToString(size: Long): String = {
+  def memoryBytesToString(size: Long, legacy:Boolean=true): String = {
+    lazy val PB = 1L << 50
     lazy val TB = 1L << 40
     lazy val GB = 1L << 30
     lazy val MB = 1L << 20
@@ -37,6 +40,7 @@ object Utils {
     def fmt(value:Double, unit:String) = "%.1f %s".formatLocal(java.util.Locale.US, value, unit)
 
     size match {
+      case _:Long if size >= 2*PB && !legacy => fmt(size.asInstanceOf[Double] / PB, "PB")
       case _:Long if size >= 2*TB => fmt(size.asInstanceOf[Double] / TB, "TB")
       case _:Long if size >= 2*GB => fmt(size.asInstanceOf[Double] / GB, "GB")
       case _:Long if size >= 2*MB => fmt(size.asInstanceOf[Double] / MB, "MB")
@@ -44,12 +48,15 @@ object Utils {
     }
   }
 
+  def awsKeysPresent(envs: JMap[String, String]): Boolean =
+    !Option(envs.get("AWS_ACCESS_KEY_ID")).isEmpty && !Option(envs.get("AWS_SECRET_ACCESS_KEY")).isEmpty
+
   /**
    * Set the AWS (e.g. EC2/S3) credentials from environmental variables
    * AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
    */
   def setAwsCredentials(conf: Configuration, envs: JMap[String, String] = System.getenv()) {
-    if (envs.get("AWS_ACCESS_KEY_ID") != null && envs.get("AWS_SECRET_ACCESS_KEY") != null) {
+    if (awsKeysPresent(envs)) {
       conf.set("fs.s3n.awsAccessKeyId", envs.get("AWS_ACCESS_KEY_ID"))
       conf.set("fs.s3.awsAccessKeyId", envs.get("AWS_ACCESS_KEY_ID"))
       conf.set("fs.s3n.awsSecretAccessKey", envs.get("AWS_SECRET_ACCESS_KEY"))
@@ -61,37 +68,39 @@ object Utils {
     filename.startsWith("s3n://") || filename.startsWith("s3://")
   }
 
-  def createReaderForS3(s3path: String, conf: Configuration): BufferedReader = {
+  def createReaderForS3(s3path: String, conf: Configuration): Option[BufferedReader] = {
 
     import java.io.InputStreamReader
     import java.net.URI
     import org.jets3t.service.impl.rest.httpclient.RestS3Service
     import org.jets3t.service.security.AWSCredentials
 
+    def accessS3(url:URI, accessKey:String, secretKey:String): Option[BufferedReader] = {
+      // Remove the / prefix in object name.
+      val objectName: String = url.getPath.substring(1)
+      val bucketName: String = url.getHost
+      val s3Service = new RestS3Service(new AWSCredentials(accessKey, secretKey))
+      val bucket = s3Service.getBucket(bucketName)
+      val s3obj = s3Service.getObject(bucket, objectName)
+      Some( new BufferedReader(new InputStreamReader(s3obj.getDataInputStream)) )
+    }
+
     // Replace the s3 or s3n protocol with http so we can parse it with Java's URI class.
     val url = new URI(s3path.replaceFirst("^s3n://", "http://").replaceFirst("^s3://", "http://"))
 
-    // Set AWS credentials
-    var accessKey: String = null
-    var secretKey: String = null
-    if (url.getUserInfo() != null) {
-      val credentials = url.getUserInfo().split("[:]")
-      accessKey = credentials(0)
-      secretKey = credentials(1)
-    } else if (conf.get("fs.s3.awsAccessKeyId") != null &&
-      conf.get("fs.s3.awsSecretAccessKey") != null) {
-      accessKey = conf.get("fs.s3.awsAccessKeyId")
-      secretKey = conf.get("fs.s3.awsSecretAccessKey")
+    Option(url.getUserInfo) match {
+      case Some(userInfo) => {
+        val Array(accessKey:String, secretKey:String) = url.getUserInfo.split("[:]")
+        accessS3(url, accessKey, secretKey)
+      }
+      case None => { // no match? then try keys
+        (Option(conf.get("fs.s3.awsAccessKeyId")),Option(conf.get("fs.s3.awsSecretAccessKey"))) match {
+          case (Some(accessKey),Some(secretKey)) => accessS3(url, accessKey, secretKey)
+          case _ => None // nothing since no keys
+        }
+      }
     }
 
-    // Remove the / prefix in object name.
-    val objectName: String = url.getPath().substring(1)
-    val bucketName: String = url.getHost()
 
-    val s3Service = new RestS3Service(new AWSCredentials(accessKey, secretKey))
-    val bucket = s3Service.getBucket(bucketName)
-    val s3obj = s3Service.getObject(bucket, objectName)
-    new BufferedReader(new InputStreamReader(s3obj.getDataInputStream()))
   }
-
 }

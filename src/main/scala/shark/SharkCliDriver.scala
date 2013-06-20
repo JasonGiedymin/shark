@@ -17,7 +17,6 @@
 
 package shark
 
-import java.io.BufferedReader
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -35,17 +34,12 @@ import org.apache.hadoop.hive.cli.{CliDriver, CliSessionState, OptionsProcessor}
 import org.apache.hadoop.hive.common.LogUtils
 import org.apache.hadoop.hive.common.LogUtils.LogInitializationException
 import org.apache.hadoop.hive.conf.HiveConf
-import org.apache.hadoop.hive.metastore.api.{FieldSchema, Schema}
 import org.apache.hadoop.hive.ql.Driver
-import org.apache.hadoop.hive.ql.exec.{FunctionRegistry, Utilities}
-import org.apache.hadoop.hive.ql.metadata.Hive
-import org.apache.hadoop.hive.ql.parse.ParseDriver
+import org.apache.hadoop.hive.ql.exec.Utilities
 import org.apache.hadoop.hive.ql.processors.{CommandProcessor, CommandProcessorFactory}
 import org.apache.hadoop.hive.ql.session.SessionState
 import org.apache.hadoop.hive.shims.ShimLoader
 import org.apache.hadoop.io.IOUtils
-
-import spark.SparkContext
 
 
 object SharkCliDriver {
@@ -246,12 +240,12 @@ class SharkCliDriver(loadRdds: Boolean = false) extends CliDriver with LogHelper
     val tokens: Array[String] = cmd_trimmed.split("\\s+")
     val cmd_1: String = cmd_trimmed.substring(tokens(0).length()).trim()
     var ret = 0
-    if (cmd_trimmed.toLowerCase().equals("quit") ||
-      cmd_trimmed.toLowerCase().equals("exit") ||
+    if (cmd_trimmed.toLowerCase.equals("quit") ||
+      cmd_trimmed.toLowerCase.equals("exit") ||
       tokens(0).equalsIgnoreCase("source") ||
       cmd_trimmed.startsWith("!") ||
-      tokens(0).toLowerCase().equals("list") ||
-      ss.asInstanceOf[CliSessionState].isRemoteMode()) {
+      tokens(0).toLowerCase.equals("list") ||
+      ss.asInstanceOf[CliSessionState].isRemoteMode) {
       super.processCmd(cmd)
     } else {
       val hconf = conf.asInstanceOf[HiveConf]
@@ -261,7 +255,7 @@ class SharkCliDriver(loadRdds: Boolean = false) extends CliDriver with LogHelper
         // Spark expects the ClassLoader to be an URLClassLoader.
         // In case we're using something else here, wrap it into an URLCLassLaoder.
         if (System.getenv("TEST_WITH_ANT") == "1") {
-          val cl = Thread.currentThread.getContextClassLoader()
+          val cl = Thread.currentThread.getContextClassLoader
           Thread.currentThread.setContextClassLoader(new URLClassLoader(Array(), cl))
         }
 
@@ -281,11 +275,11 @@ class SharkCliDriver(loadRdds: Boolean = false) extends CliDriver with LogHelper
           qp.init()
           val out = ss.out
           val start:Long = System.currentTimeMillis()
-          if (ss.getIsVerbose()) {
+          if (ss.getIsVerbose) {
             out.println(cmd)
           }
 
-          ret = qp.run(cmd).getResponseCode()
+          ret = qp.run(cmd).getResponseCode
           if (ret != 0) {
             qp.close()
             return ret
@@ -308,8 +302,8 @@ class SharkCliDriver(loadRdds: Boolean = false) extends CliDriver with LogHelper
             }
           } catch {
             case e:IOException =>
-              console.printError("Failed with exception " + e.getClass().getName() + ":" +
-                e.getMessage(), "\n" + org.apache.hadoop.util.StringUtils.stringifyException(e))
+              console.printError("Failed with exception " + e.getClass.getName + ":" +
+                e.getMessage, "\n" + org.apache.hadoop.util.StringUtils.stringifyException(e))
               ret = 1
           }
 
@@ -330,10 +324,10 @@ class SharkCliDriver(loadRdds: Boolean = false) extends CliDriver with LogHelper
           }
 
         } else {
-          if (ss.getIsVerbose()) {
+          if (ss.getIsVerbose) {
             ss.out.println(tokens(0) + " " + cmd_1)
           }
-          ret = proc.run(cmd_1).getResponseCode()
+          ret = proc.run(cmd_1).getResponseCode
         }
       }
     }
@@ -341,24 +335,27 @@ class SharkCliDriver(loadRdds: Boolean = false) extends CliDriver with LogHelper
   }
 
   override def processFile(fileName: String): Int = {
-    if (Utils.isS3File(fileName)) {
+    def processS3Reader():Int = {
       // For S3 file, fetch it from S3 and pass it to Hive.
-      val conf = ss.getConf()
+      val conf = ss.getConf
+
       Utils.setAwsCredentials(conf)
-      var bufferReader: BufferedReader = null
-      var rc: Int = 0
-      try {
-        bufferReader = Utils.createReaderForS3(fileName, conf)
-        rc = processReader(bufferReader)
-        bufferReader.close()
-        bufferReader = null
-      } finally {
-        IOUtils.closeStream(bufferReader)
+      Utils.createReaderForS3(fileName, conf) match {
+        case Some(bufferedReader) => {
+          try {
+            val rc = processReader(bufferedReader)
+            bufferedReader.close()
+            rc
+          }
+          finally {
+            IOUtils.closeStream(bufferedReader)
+          }
+        }
+        case _ => 0
       }
-      rc
-    } else {
-      // For non-S3 file, just use Hive's processFile.
-      super.processFile(fileName)
     }
+
+    if (Utils.isS3File(fileName)) processS3Reader()
+    else super.processFile(fileName) // For non-S3 file, just use Hive's processFile.
   }
 }
