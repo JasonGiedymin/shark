@@ -19,7 +19,6 @@ package shark
 
 import java.io._
 import java.net.URLClassLoader
-import java.util.ArrayList
 import jline.{History, ConsoleReader}
 import scala.collection.JavaConversions._
 
@@ -124,7 +123,7 @@ trait DriverHelper extends LogHelper {
     printHeader( Option(driver.getSchema.getFieldSchemas).map(_.toList).getOrElse(List()) )
 
     try {
-      val res:ArrayList[String] = new ArrayList[String]()
+      val res:java.util.ArrayList[String] = new java.util.ArrayList[String]()
       while (!out.checkError() && driver.getResults(res)) {
         res.foreach(out.println(_))
         res.clear()
@@ -161,71 +160,83 @@ object SharkCliDriver {
     val hiveArgs = args.filterNot(_.equals("-loadRdds"))
     val loadRdds = hiveArgs.length < args.length
     val oproc = new OptionsProcessor()
-    if (!oproc.process_stage1(hiveArgs)) {
-      System.exit(1)
+    if (!oproc.process_stage1(hiveArgs)) System.exit(1)
+
+
+    def initHiveLogs():(Boolean, String) = {
+      try {
+        (false, LogUtils.initHiveLog4j)
+      } catch {
+        case e: LogInitializationException => (true, e.getMessage)
+      }
+    }
+
+    def buildSessionState(): Option[CliSessionState] = {
+      val sessionState = new CliSessionState(new HiveConf(classOf[SessionState]))
+
+      try {
+        sessionState.in = System.in
+        sessionState.out = new PrintStream(System.out, true, "UTF-8")
+        sessionState.info = new PrintStream(System.err, true, "UTF-8")
+        sessionState.err = new PrintStream(System.err, true, "UTF-8")
+        Some(sessionState)
+      } catch {
+        case e: UnsupportedEncodingException => None
+      }
+    }
+
+    def cleanup() {
+      // Clean up after we exit
+      Runtime.getRuntime.addShutdownHook(
+        new Thread() {
+          override def run() {
+            SharkEnv.stop()
+          }
+        }
+      )
     }
 
     // NOTE: It is critical to do this here so that log4j is reinitialized
     // before any of the other core hive classes are loaded
-    var logInitFailed = false
-    var logInitDetailMessage: String = null
-    try {
-      logInitDetailMessage = LogUtils.initHiveLog4j()
-    } catch {
-      case e: LogInitializationException =>
-        logInitFailed = true
-        logInitDetailMessage = e.getMessage()
-    }
-
-    var ss = new CliSessionState(new HiveConf(classOf[SessionState]))
-    ss.in = System.in
-    try {
-      ss.out = new PrintStream(System.out, true, "UTF-8")
-      ss.info = new PrintStream(System.err, true, "UTF-8");
-      ss.err = new PrintStream(System.err, true, "UTF-8")
-    } catch {
-      case e: UnsupportedEncodingException => System.exit(3)
-    }
-
-    if (!oproc.process_stage2(ss)) {
-      System.exit(2)
-    }
-
-    if (!ss.getIsSilent()) {
+    val (logInitFailed, logInitDetailMessage) = initHiveLogs()
+    def logErrors() {
       if (logInitFailed) System.err.println(logInitDetailMessage)
-      else SessionState.getConsole().printInfo(logInitDetailMessage)
+      else SessionState.getConsole.printInfo(logInitDetailMessage)
     }
 
-    // Set all properties specified via command line.
-    val conf: HiveConf = ss.getConf()
-    ss.cmdProperties.entrySet().foreach { item: java.util.Map.Entry[Object, Object] =>
-      conf.set(item.getKey().asInstanceOf[String], item.getValue().asInstanceOf[String])
-      ss.getOverriddenConfigurations().put(
-        item.getKey().asInstanceOf[String], item.getValue().asInstanceOf[String])
-    }
-
-    SessionState.start(ss)
-
-    // Clean up after we exit
-    Runtime.getRuntime().addShutdownHook(
-      new Thread() {
-        override def run() {
-          SharkEnv.stop()
+    val sessionState = buildSessionState()
+    sessionState match {
+      case Some(session) if (!oproc.process_stage2(session)) => System.exit(2)
+      case Some(session) if (!session.getIsSilent) => { // SEE: TODO: start ripping from here
+        logErrors()
+        // Set all properties specified via command line.
+        val conf: HiveConf = session.getConf
+        session.cmdProperties.entrySet().foreach { item: java.util.Map.Entry[Object, Object] =>
+          conf.set(item.getKey.asInstanceOf[String], item.getValue.asInstanceOf[String])
+          session.getOverriddenConfigurations.put(
+            item.getKey.asInstanceOf[String], item.getValue.asInstanceOf[String])
         }
+
+        SessionState.start(session)
       }
-    )
+      case None => System.exit(3)
+    }
+
+    cleanup()
+
+    // TODO: start ripping from here
 
     // "-h" option has been passed, so connect to Shark Server.
-    if (ss.getHost() != null) {
-      ss.connect()
-      if (ss.isRemoteMode()) {
-        prompt = "[" + ss.getHost + ':' + ss.getPort + "] " + prompt
+    if (sessionState.getHost() != null) {
+      sessionState.connect()
+      if (sessionState.isRemoteMode()) {
+        prompt = "[" + sessionState.getHost + ':' + sessionState.getPort + "] " + prompt
         val spaces = Array.tabulate(prompt.length)(_ => ' ')
         prompt2 = new String(spaces)
       }
     }
 
-    if (!ss.isRemoteMode() && !ShimLoader.getHadoopShims().usesJobShell()) {
+    if (!sessionState.isRemoteMode() && !ShimLoader.getHadoopShims().usesJobShell()) {
       // Hadoop-20 and above - we need to augment classpath using hiveconf
       // components.
       // See also: code in ExecDriver.java
@@ -242,15 +253,15 @@ object SharkCliDriver {
     cli.setHiveVariables(oproc.getHiveVariables())
 
     // Execute -i init files (always in silent mode)
-    cli.processInitFiles(ss)
+    cli.processInitFiles(sessionState)
 
-    if (ss.execString != null) {
-      System.exit(cli.processLine(ss.execString))
+    if (sessionState.execString != null) {
+      System.exit(cli.processLine(sessionState.execString))
     }
 
     try {
-      if (ss.fileName != null) {
-        System.exit(cli.processFile(ss.fileName))
+      if (sessionState.fileName != null) {
+        System.exit(cli.processFile(sessionState.fileName))
       }
     } catch {
       case e: FileNotFoundException =>
@@ -293,7 +304,7 @@ object SharkCliDriver {
     var ret = 0
 
     var prefix = ""
-    var curDB = getFormattedDbMethod.invoke(null, conf, ss).asInstanceOf[String]
+    var curDB = getFormattedDbMethod.invoke(null, conf, sessionState).asInstanceOf[String]
     var curPrompt = SharkCliDriver.prompt + curDB
     var dbSpaces = spacesForStringMethod.invoke(null, curDB).asInstanceOf[String]
 
@@ -317,7 +328,7 @@ object SharkCliDriver {
       line = reader.readLine(curPrompt + "> ")
     }
 
-    ss.close()
+    sessionState.close()
 
     System.exit(ret)
   }
