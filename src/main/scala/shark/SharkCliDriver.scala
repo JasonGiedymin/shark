@@ -39,18 +39,17 @@ import org.apache.hadoop.io.IOUtils
 import scala.Some
 import org.apache.hadoop.hive.metastore.api.FieldSchema
 
-
 trait DriverHelper extends LogHelper {
   val sessionState: Option[SessionState] = Option(SessionState.get())
-  val conf: Configuration = if (!sessionState.isEmpty) sessionState.get.getConf else new Configuration()
-
   val out = sessionState.get.out
-  val start:Long = System.currentTimeMillis()
+
+  val conf: Configuration = if (!sessionState.isEmpty) sessionState.get.getConf else new Configuration()
+  val hiveConf = conf.asInstanceOf[HiveConf]
 
   val LOG = LogFactory.getLog("CliDriver")
   val console: SessionState.LogHelper = new SessionState.LogHelper(LOG)
 
-  def isRemote: Boolean = sessionState.asInstanceOf[CliSessionState].isRemoteMode
+  def isRemote: Boolean = sessionState.map { _.asInstanceOf[CliSessionState].isRemoteMode }.getOrElse(false)
 
   def init() {
     SharkConfVars.initializeWithDefaults(conf)
@@ -60,7 +59,7 @@ trait DriverHelper extends LogHelper {
     SharkEnv.init()
   }
 
-  def recordTiming() {
+  def recordTiming(start:Long) {
     val end:Long = System.currentTimeMillis()
     if (end > start) {
       val timeTaken:Double = (end - start) / 1000.0
@@ -68,19 +67,23 @@ trait DriverHelper extends LogHelper {
     }
   }
 
-  def printHeader(fieldSchemas: Option[List[FieldSchema]]) {
+  def printHeader(fieldSchemas: List[FieldSchema]) {
     // really should consider just returning the logging data
     // or async log it all
     if (HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_CLI_PRINT_HEADER)) {
       // Print the column names.
-      fieldSchemas match {
-        case Some(schemas) => out.println(schemas.map(_.getName).mkString("\t"))
-        case _ => // do nothing
-      }
+      out.println(fieldSchemas.map(_.getName).mkString("\t"))
     }
   }
 
   def log(action:() => Unit) {
+    sessionState match {
+      case Some(state) if(state.getIsVerbose) => action()
+      case _ => /* Do Nothing */
+    }
+  }
+
+  def usingSessionState(action:() => Unit) {
     sessionState match {
       case Some(state) if(state.getIsVerbose) => action()
       case _ => /* Do Nothing */
@@ -98,28 +101,56 @@ trait DriverHelper extends LogHelper {
 
   def getDriver(hiveConf: HiveConf, proc: CommandProcessor): Driver = {
     if (SharkConfVars.getVar(conf, SharkConfVars.EXEC_MODE) == "shark") {
-      new SharkDriver(hiveConf)
+      val driver = new SharkDriver(hiveConf)
+      driver.init()
+      driver
     } else {
       proc.asInstanceOf[Driver]
     }
   }
 
-  def runCommand(driver:Driver, commandInput: String): Option[Int] = {
+  def runCommand(driver:Driver, commandInput: String): Either[Int, (Driver, Int)] = {
     driver.run(commandInput).getResponseCode match {
       case resCode:Int if (resCode != 0) => {
+        println("--> in case resCode, %s" format resCode)
         driver.close
-        Some(resCode)
+        Right(driver, resCode)
       }
-      case _ => None
+      case _ => Right(driver, 0)
     }
   }
 
-  def destroyDriver(driver: Driver) {
-    recordTiming()
+  def inspectState(driver: Driver)(implicit start:Long): Int = {
+    printHeader( Option(driver.getSchema.getFieldSchemas).map(_.toList).getOrElse(List()) )
+
+    try {
+      val res:ArrayList[String] = new ArrayList[String]()
+      while (!out.checkError() && driver.getResults(res)) {
+        res.foreach(out.println(_))
+        res.clear()
+      }
+      val ret = driver.close()
+      destroyDriver(driver)
+      ret
+    } catch {
+      case e:IOException => {
+        console.printError("Failed with exception %s:%s\n%s" format(e.getClass.getName,
+          e.getMessage,
+          org.apache.hadoop.util.StringUtils.stringifyException(e))
+        )
+        destroyDriver(driver)
+        0
+      }
+    }
+  }
+
+  def destroyDriver(driver: Driver)(implicit start:Long) {
+    recordTiming(start)
     // Destroy the driver to release all the locks.
     if (driver.isInstanceOf[SharkDriver]) driver.destroy()
   }
 }
+
 
 object SharkCliDriver {
 
@@ -298,6 +329,12 @@ class SharkCliDriver(loadRdds: Boolean = false)
   with LogHelper
   with DriverHelper {
 
+  SharkConfVars.initializeWithDefaults(conf)
+
+  // Force initializing SharkEnv. This is put here but not object SharkCliDriver
+  // because the Hive unit tests do not go through the main() code path.
+  SharkEnv.init()
+
   if(loadRdds) CachedTableRecovery.loadAsRdds(processCmd(_))
 
   def this() = this(false)
@@ -314,65 +351,22 @@ class SharkCliDriver(loadRdds: Boolean = false)
     def properCmd: Boolean = firstToken.equalsIgnoreCase("source") ||
       firstToken.toLowerCase.equals("list")
 
-    def inspectState(driver: Driver): Either[Int, Int] = {
-      import scala.collection.JavaConverters._
-      printHeader( Option(driver.getSchema.getFieldSchemas.asScala.toList) )
-
-      try {
-        val res:ArrayList[String] = new ArrayList[String]()
-        while (!out.checkError() && driver.getResults(res)) {
-          res.foreach(out.println(_))
-          res.clear()
-        }
-        Right(0)
-      } catch {
-        case e:IOException => {
-          console.printError("Failed with exception %s:%s\n%s" format(e.getClass.getName,
-            e.getMessage,
-            org.apache.hadoop.util.StringUtils.stringifyException(e))
-          )
-          Left(1)
-        }
-      }
-    }
-
-    def handleDriver(hiveConf: HiveConf, proc: CommandProcessor): Int = {
-      // There is a small overhead here to create a new instance of
-      // SharkDriver for every command. But it saves us the hassle of
-      // hacking CommandProcessorFactory.
-      val driver: Driver = getDriver(hiveConf, proc)
-      driver.init()
-
-      logInfo("Execution Mode: %s" format SharkConfVars.getVar(conf, SharkConfVars.EXEC_MODE))
-      log {() => out.println(commandInput)}
-
-      runCommand(driver, commandInput) getOrElse {
-        inspectState(driver) match {
-          case Right(r) => {
-            val ret = driver.close()
-            destroyDriver(driver)
-            ret
-          }
-          case Left(l) => {
-            destroyDriver(driver)
-            0
-          }
-        }
-      }
-
-    }
-
-    def alternativeProcess(): Int = {
-      val hiveConf = conf.asInstanceOf[HiveConf]
-
+    def alternativeProcess():Int = {
       Option(CommandProcessorFactory.get(firstToken, hiveConf)) match {
-        case Some(proc: CommandProcessor) if (proc.isInstanceOf[Driver]) => {
-          setThreadContext()
-          handleDriver(hiveConf, proc)
-        }
-        case Some(proc: CommandProcessor) => {
-          setThreadContext()
+        case Some(proc:CommandProcessor) if (proc.isInstanceOf[Driver]) => {
+          logInfo("Execution Mode: " + SharkConfVars.getVar(conf, SharkConfVars.EXEC_MODE))
+          log{ () => out.println(cmd)}
 
+          setThreadContext()
+          implicit val start:Long = System.currentTimeMillis()
+          runCommand( getDriver(hiveConf, proc), commandInput ) match {
+            case Right((driver, ret)) => inspectState(driver)
+            case Left(l) => 0
+          }
+
+        }
+        case Some(proc:CommandProcessor) => {
+          setThreadContext()
           log {() => out.println("%s %s" format(firstToken,firstCommand))}
           proc.run(firstCommand).getResponseCode
         }
