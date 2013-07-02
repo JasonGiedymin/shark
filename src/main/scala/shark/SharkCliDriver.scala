@@ -185,7 +185,7 @@ object SharkCliDriver {
       }
     }
 
-    def cleanup() {
+    def addHooks() {
       // Clean up after we exit
       Runtime.getRuntime.addShutdownHook(
         new Thread() {
@@ -194,6 +194,37 @@ object SharkCliDriver {
           }
         }
       )
+    }
+
+    case class DriverState(conf:HiveConf, session:CliSessionState)
+
+    def saveKeys(driverState:DriverState): DriverState = {
+      driverState.session.cmdProperties.entrySet().foreach { item: java.util.Map.Entry[Object, Object] =>
+        driverState.conf.set(item.getKey.asInstanceOf[String], item.getValue.asInstanceOf[String])
+        driverState.session.getOverriddenConfigurations.put(
+          item.getKey.asInstanceOf[String], item.getValue.asInstanceOf[String])
+      }
+      driverState
+    }
+
+    def startSession(driverState:DriverState): DriverState = {
+      SessionState.start(driverState.session)
+      driverState
+    }
+
+    def handleHost(driverState:DriverState): DriverState = {
+      // "-h" option has been passed, so connect to Shark Server.
+      Option(driverState.session.getHost) match {
+        case Some(host:String) if driverState.session.isRemoteMode => {
+          driverState.session.connect()
+          prompt = "[" + driverState.session.getHost + ':' + driverState.session.getPort + "] " + prompt
+          val spaces = Array.tabulate(prompt.length)(_ => ' ')
+          prompt2 = new String(spaces)
+        }
+        case Some(host:String) => driverState.session.connect()
+      }
+
+      driverState
     }
 
     // NOTE: It is critical to do this here so that log4j is reinitialized
@@ -211,31 +242,39 @@ object SharkCliDriver {
         logErrors()
         // Set all properties specified via command line.
         val conf: HiveConf = session.getConf
-        session.cmdProperties.entrySet().foreach { item: java.util.Map.Entry[Object, Object] =>
-          conf.set(item.getKey.asInstanceOf[String], item.getValue.asInstanceOf[String])
-          session.getOverriddenConfigurations.put(
-            item.getKey.asInstanceOf[String], item.getValue.asInstanceOf[String])
+        val driverState:DriverState = DriverState(conf, session)
+
+        val work = saveKeys _ andThen
+          startSession _ andThen
+          handleHost _
+
+        work(driverState)
+
+        //saveKeys(session, conf)
+        //SessionState.start(session)
+
+        addHooks()
+
+        //handleHost()
+
+        if (!sessionState.isRemoteMode() && !ShimLoader.getHadoopShims().usesJobShell()) {
+          // Hadoop-20 and above - we need to augment classpath using hiveconf
+          // components.
+          // See also: code in ExecDriver.java
+          var loader = conf.getClassLoader()
+          val auxJars = HiveConf.getVar(conf, HiveConf.ConfVars.HIVEAUXJARS)
+          if (StringUtils.isNotBlank(auxJars)) {
+            loader = Utilities.addToClassPath(loader, StringUtils.split(auxJars, ","))
+          }
+          conf.setClassLoader(loader)
+          Thread.currentThread().setContextClassLoader(loader)
         }
 
-        SessionState.start(session)
       }
       case None => System.exit(3)
     }
 
-    cleanup()
-
     // TODO: start ripping from here
-
-    // "-h" option has been passed, so connect to Shark Server.
-    if (sessionState.getHost() != null) {
-      sessionState.connect()
-      if (sessionState.isRemoteMode()) {
-        prompt = "[" + sessionState.getHost + ':' + sessionState.getPort + "] " + prompt
-        val spaces = Array.tabulate(prompt.length)(_ => ' ')
-        prompt2 = new String(spaces)
-      }
-    }
-
     if (!sessionState.isRemoteMode() && !ShimLoader.getHadoopShims().usesJobShell()) {
       // Hadoop-20 and above - we need to augment classpath using hiveconf
       // components.
